@@ -1,0 +1,116 @@
+name: Telegram Desktop macOS — unsigned (with API)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master, dev, main ]
+
+concurrency:
+  group: macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]   # соберём отдельно для Apple Silicon и Intel
+
+    env:
+      APP_NAME: Telegram
+      # можно оставить включённый автоапдейтер; для unsigned иногда мешает — отключим:
+      DISABLE_AUTOUPDATE: "ON"
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select full Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Install build deps
+        run: |
+          brew update
+          brew install automake meson nasm ninja pkg-config cmake yasm ccache qt@6 ffmpeg
+          echo 'export PATH="/opt/homebrew/opt/qt@6/bin:$PATH"' >> $GITHUB_ENV
+
+      # Кэш подготовленных сторонних библиотек (ускоряет повторные сборки)
+      - name: Cache ThirdParty
+        uses: actions/cache@v4
+        with:
+          path: ThirdParty
+          key: ${{ runner.os }}-thirdparty-${{ hashFiles('Telegram/build/prepare/') }}
+          restore-keys: ${{ runner.os }}-thirdparty-
+
+      - name: Cache Libraries
+        uses: actions/cache@v4
+        with:
+          path: Libraries
+          key: ${{ runner.os }}-libraries-${{ hashFiles('Telegram/build/prepare/') }}
+          restore-keys: ${{ runner.os }}-libraries-
+
+      # Официальная подготовка зависимостей (соберёт ada и всё остальное)
+      - name: Prepare third-party (official)
+        run: bash Telegram/build/prepare/mac.sh skip-release silent
+
+      # Конфигурация Release с подстановкой API-ключей из Secrets
+      - name: Configure (Release ${{ matrix.arch }})
+        run: |
+          cd Telegram
+          ./configure.sh \
+            -D CMAKE_BUILD_TYPE=Release \
+            -D CMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+            -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=${{ env.DISABLE_AUTOUPDATE }} \
+            -D TDESKTOP_API_ID=${{ secrets.TDESKTOP_API_ID }} \
+            -D TDESKTOP_API_HASH=${{ secrets.TDESKTOP_API_HASH }}
+
+      - name: Build
+        run: cmake --build out --config Release --parallel
+
+      # Находим .app
+      - name: Locate .app
+        id: locate
+        run: |
+          APP_PATH=$(find out -type d -name "${{ env.APP_NAME }}.app" -maxdepth 3 | head -n1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Telegram.app not found"; exit 1
+          fi
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
+
+      # Подтянуть Qt-фреймворки внутрь .app
+      - name: macdeployqt
+        run: macdeployqt "${{ steps.locate.outputs.app_path }}" -verbose=2 || true
+
+      # Собрать .dmg (unsigned)
+      - name: Make DMG
+        id: makedmg
+        run: |
+          set -e
+          APP="${{ steps.locate.outputs.app_path }}"
+          VOL="Telegram"
+          DMG="${{ env.APP_NAME }}-${{ matrix.arch }}-unsigned.dmg"
+          mkdir dmgroot
+          cp -R "$APP" dmgroot/
+          hdiutil create -volname "$VOL" -srcfolder dmgroot -ov -format UDZO "$DMG"
+          rm -rf dmgroot
+          echo "dmg=$DMG" >> $GITHUB_OUTPUT
+
+      # Альтернативная упаковка .app в zip
+      - name: Zip .app
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            "${{ steps.locate.outputs.app_path }}" \
+            "${{ env.APP_NAME }}-${{ matrix.arch }}-unsigned.zip"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-macOS-${{ matrix.arch }}-unsigned
+          path: |
+            ${{ steps.locate.outputs.app_path }}
+            ${{ steps.makedmg.outputs.dmg }}
+            ${{ env.APP_NAME }}-${{ matrix.arch }}-unsigned.zip
